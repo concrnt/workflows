@@ -1,0 +1,91 @@
+name: Dependabot auto-merge (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      merge-method:
+        description: "squash | merge | rebase"
+        type: string
+        default: squash
+      allow-major:
+        description: "true にすると semver-major も approve/merge する"
+        type: boolean
+        default: false
+      major-label:
+        description: "人手に残す semver-major PR に付けるラベル"
+        type: string
+        default: "dependencies:major"
+      approve:
+        description: "auto-merge の前に approve する(review 必須 repo 用。can_approve_pull_request_reviews=true が前提)"
+        type: boolean
+        default: false
+
+jobs:
+  auto-merge:
+    # github.event は caller 側の pull_request イベント。
+    # write token を持つ job なので PR のコードは checkout しない。
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.user.login == 'dependabot[bot]' &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Classify
+        id: cls
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          ALLOW_MAJOR: ${{ inputs.allow-major }}
+          DEPS: ${{ steps.meta.outputs.dependency-names }}
+        run: |
+          set -euo pipefail
+          mergeable=$(gh pr view "$PR_NUMBER" --json mergeable -q .mergeable)
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ] && [ "$ALLOW_MAJOR" != "true" ]; then
+            action=label
+          elif [ "$mergeable" = "CONFLICTING" ]; then
+            # Dependabot が rebase すると synchronize で再実行される
+            action=skip
+          else
+            action=merge
+          fi
+          echo "action=$action" >> "$GITHUB_OUTPUT"
+          echo "PR #$PR_NUMBER deps=$DEPS type=$UPDATE_TYPE mergeable=$mergeable action=$action"
+
+      - name: Label major bump for human review
+        if: steps.cls.outputs.action == 'label'
+        env:
+          LABEL: ${{ inputs.major-label }}
+        run: |
+          set -euo pipefail
+          gh label create "$LABEL" --color D93F0B --description "Major dependency bump - needs human review" --force
+          gh pr edit "$PR_NUMBER" --add-label "$LABEL"
+
+      - name: Approve
+        if: steps.cls.outputs.action == 'merge' && inputs.approve
+        env:
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          set -euo pipefail
+          if [ "$(gh pr view "$PR_NUMBER" --json reviewDecision -q .reviewDecision)" != "APPROVED" ]; then
+            gh pr review --approve "$PR_NUMBER" --body "Auto-approved Dependabot $UPDATE_TYPE update."
+          fi
+
+      - name: Enable auto-merge
+        if: steps.cls.outputs.action == 'merge'
+        env:
+          MERGE_METHOD: ${{ inputs.merge-method }}
+        run: gh pr merge --auto "--$MERGE_METHOD" "$PR_NUMBER"
